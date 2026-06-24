@@ -1,127 +1,262 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+const GEMINI_MODELS = [
+  "gemini-2.0-flash",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-1.5-flash",
+];
+
+function arrayBufferToBase64(buffer: ArrayBuffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+
+  return btoa(binary);
+}
+
+async function callGeminiWithFallback(params: {
+  apiKey: string;
+  base64Image: string;
+  mimeType: string;
+}) {
+  const { apiKey, base64Image, mimeType } = params;
+
+  const prompt = `تو یک مهندس ناظر و تحلیل‌گر کارگاه ساختمانی هستی.
+این تصویر گزارش کارگاهی را بررسی کن و خروجی را به فارسی و کاربردی بده.
+
+لطفاً این موارد را تحلیل کن:
+1. وضعیت کلی تصویر
+2. نکات ایمنی احتمالی
+3. میزان پیشرفت یا نوع فعالیت قابل مشاهده
+4. مشکلات یا ریسک‌های احتمالی
+5. پیشنهاد اجرایی کوتاه برای مسئول کارگاه
+
+جواب را خلاصه، واضح و حرفه‌ای بنویس.`;
+
+  let lastErrorText = "";
+
+  for (const model of GEMINI_MODELS) {
+    console.log(`🤖 Trying Gemini model: ${model}`);
+
+    const geminiUrl =
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+
+    const response = await fetch(geminiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              { text: prompt },
+              {
+                inline_data: {
+                  mime_type: mimeType,
+                  data: base64Image,
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.4,
+          topK: 32,
+          topP: 1,
+          maxOutputTokens: 1024,
+        },
+      }),
+    });
+
+    const rawText = await response.text();
+
+    console.log(`📡 Gemini model ${model} status:`, response.status);
+
+    if (!response.ok) {
+      console.error(`❌ Gemini model ${model} error body:`, rawText);
+      lastErrorText = `model=${model}, status=${response.status}, body=${rawText}`;
+
+      if (response.status === 404) {
+        continue;
+      }
+
+      if (response.status === 400 || response.status === 401 || response.status === 403) {
+        throw new Error(
+          `خطا از Gemini دریافت شد. احتمالاً GEMINI_API_KEY اشتباه است یا دسترسی ندارد. ${lastErrorText}`,
+        );
+      }
+
+      continue;
+    }
+
+    let data: any;
+
+    try {
+      data = JSON.parse(rawText);
+    } catch (_error) {
+      console.error("❌ Gemini JSON parse error:", rawText);
+      throw new Error("پاسخ Gemini قابل تبدیل به JSON نبود.");
+    }
+
+    const analysis =
+      data?.candidates?.[0]?.content?.parts?.[0]?.text ||
+      "تحلیل هوش مصنوعی انجام شد، اما متن قابل خواندن از پاسخ Gemini دریافت نشد.";
+
+    console.log(`✅ Gemini success with model: ${model}`);
+
+    return {
+      model,
+      analysis,
+      raw: data,
+    };
+  }
+
+  throw new Error(
+    `هیچ‌کدام از مدل‌های Gemini جواب ندادند. آخرین خطا: ${lastErrorText}`,
+  );
 }
 
 serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders })
+  if (req.method === "OPTIONS") {
+    return new Response("ok", {
+      headers: corsHeaders,
+      status: 200,
+    });
   }
 
   try {
-    // ۱. دریافت اطلاعات از درخواست
-    const { imageUrl, reportId } = await req.json()
-    
-    if (!imageUrl || !reportId) {
-      throw new Error("imageUrl یا reportId ارسال نشده است");
+    console.log("🚀 analyze-report function started");
+
+    const body = await req.json();
+    console.log("📦 Request body:", JSON.stringify(body));
+
+    const { imageUrl, reportId } = body;
+
+    if (!imageUrl) {
+      throw new Error("imageUrl ارسال نشده است.");
     }
 
-    // ۲. اتصال به دیتابیس
-    const supabaseClient = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-    )
-
-    // ۳. دانلود تصویر و تبدیل به Base64
-    const imageResponse = await fetch(imageUrl);
-    if (!imageResponse.ok) {
-      throw new Error(`دانلود تصویر ناموفق بود: status ${imageResponse.status}`);
+    if (!reportId) {
+      throw new Error("reportId ارسال نشده است.");
     }
 
-    const arrayBuffer = await imageResponse.arrayBuffer();
-    const uint8Array = new Uint8Array(arrayBuffer);
-    const base64Image = btoa(
-      uint8Array.reduce((data, byte) => data + String.fromCharCode(byte), '')
-    );
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseServiceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    const geminiApiKey = Deno.env.get("GEMINI_API_KEY");
 
-    // ۴. درخواست به Gemini
-    const geminiApiKey = Deno.env.get('GEMINI_API_KEY');
+    console.log("🔑 Checking environment variables...");
+
+    if (!supabaseUrl) {
+      throw new Error("SUPABASE_URL در Secrets تنظیم نشده است.");
+    }
+
+    if (!supabaseServiceRoleKey) {
+      throw new Error("SUPABASE_SERVICE_ROLE_KEY در Secrets تنظیم نشده است.");
+    }
+
     if (!geminiApiKey) {
-      throw new Error("GEMINI_API_KEY تنظیم نشده است");
+      throw new Error("GEMINI_API_KEY در Secrets تنظیم نشده است.");
     }
 
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiApiKey}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { 
-                text: 'تو یک مهندس ناظر خبره ساختمانی هستی. تصویر ارسالی از کارگاه را با دقت تحلیل کن و نکات فنی، ایمنی و پیشرفت کار را به زبان فارسی و تخصصی گزارش بده.' 
-              },
-              { 
-                inline_data: { 
-                  mime_type: "image/jpeg", 
-                  data: base64Image
-                } 
-              }
-            ]
-          }]
-        }),
-      }
-    );
-
-    const aiData = await geminiRes.json();
-
-    if (!geminiRes.ok) {
-      // اگر خود Gemini خطای ساختاری داده
-      throw new Error(
-        `خطا از سمت Gemini: status ${geminiRes.status}, body: ${JSON.stringify(aiData)}`
+    if (!geminiApiKey.startsWith("AIza")) {
+      console.warn(
+        "⚠️ هشدار: کلید Gemini معمولاً با AIza شروع می‌شود. کلید فعلی شاید کلید Gemini نباشد.",
       );
     }
 
-    if (!aiData.candidates || aiData.candidates.length === 0) {
-      throw new Error("پاسخ هوش مصنوعی خالی بود: " + JSON.stringify(aiData));
+    const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+
+    console.log("🖼️ Downloading image from:", imageUrl);
+
+    const imageResponse = await fetch(imageUrl);
+
+    if (!imageResponse.ok) {
+      const imageErrorText = await imageResponse.text();
+      console.error("❌ Image download failed:", imageResponse.status, imageErrorText);
+      throw new Error(`دانلود تصویر ناموفق بود. status=${imageResponse.status}`);
     }
 
-    // ایمن گرفتن متن
-    const firstCandidate = aiData.candidates[0];
-    const firstPartText =
-      firstCandidate?.content?.parts?.[0]?.text ??
-      firstCandidate?.content?.parts?.map((p: any) => p.text).join('\n');
+    const contentType = imageResponse.headers.get("content-type") || "image/jpeg";
+    console.log("🧾 Image content-type:", contentType);
 
-    if (!firstPartText) {
-      throw new Error(
-        "ساختار پاسخ Gemini مطابق انتظار نیست: " + JSON.stringify(aiData)
-      );
-    }
+    const imageArrayBuffer = await imageResponse.arrayBuffer();
+    const base64Image = arrayBufferToBase64(imageArrayBuffer);
 
-    const analysis = firstPartText;
+    console.log("🤖 Sending image to Gemini with fallback models...");
 
-    // ۵. آپدیت دیتابیس
-    const { error: updateError } = await supabaseClient
-      .from('reports')
-      .update({ 
-        analysis,
-        status: 'completed' 
-      })
-      .eq('id', reportId);
-
-    if (updateError) {
-      throw new Error("خطا در آپدیت جدول reports: " + updateError.message);
-    }
-
-    return new Response(JSON.stringify({ success: true, analysis }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      status: 200,
+    const geminiResult = await callGeminiWithFallback({
+      apiKey: geminiApiKey,
+      base64Image,
+      mimeType: contentType,
     });
 
-  } catch (error: any) {
-    console.error('analyze-report error:', error);
+    const analysis = geminiResult.analysis;
+
+    console.log("📝 Analysis:", analysis);
+    console.log("🧠 Used Gemini model:", geminiResult.model);
+
+    console.log("💾 Updating report in database:", reportId);
+
+    const { data: updatedReport, error: updateError } = await supabase
+      .from("reports")
+      .update({
+        ai_analysis: analysis,
+        status: "completed",
+      })
+      .eq("id", reportId)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error("❌ Database update error:", updateError);
+      throw new Error(`خطا در آپدیت دیتابیس: ${updateError.message}`);
+    }
+
+    console.log("✅ Report updated successfully:", JSON.stringify(updatedReport));
 
     return new Response(
-      JSON.stringify({ error: error.message || String(error) }),
+      JSON.stringify({
+        success: true,
+        message: "تحلیل با موفقیت انجام شد.",
+        usedModel: geminiResult.model,
+        analysis,
+        report: updatedReport,
+      }),
       {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
+        status: 200,
+      },
+    );
+  } catch (error: any) {
+    console.error("❌ خطای واقعی:", error?.message || error);
+
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: error?.message || "خطای نامشخص در اجرای فانکشن",
+      }),
+      {
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
         status: 400,
-      }
+      },
     );
   }
 });
